@@ -25,16 +25,28 @@ type Progress struct {
 	enabled bool
 	now     func() time.Time
 	tick    time.Duration
+	// cols returns the terminal width, or 0 if unknown.
+	cols func() int
+	pal  Palette
 }
 
 // New returns a Progress writing to w. Redraws are used only when w is a terminal.
 // A disabled Progress (enabled=false) prints nothing, e.g. for -o json.
 func New(w io.Writer, enabled bool) *Progress {
-	tty := false
+	p := &Progress{w: w, enabled: enabled, now: time.Now, tick: 100 * time.Millisecond, cols: func() int { return 0 },
+		pal: Palette{On: enabled && ColorEnabled(w)}}
 	if f, ok := w.(*os.File); ok {
-		tty = term.IsTerminal(int(f.Fd())) // #nosec G115 -- fd fits in int
+		fd := int(f.Fd()) // #nosec G115 -- fd fits in int
+		p.tty = term.IsTerminal(fd)
+		p.cols = func() int {
+			c, _, err := term.GetSize(fd)
+			if err != nil {
+				return 0
+			}
+			return c
+		}
 	}
-	return &Progress{w: w, tty: tty, enabled: enabled, now: time.Now, tick: 100 * time.Millisecond}
+	return p
 }
 
 // Step is one running operation.
@@ -83,16 +95,13 @@ func (s *Step) spin() {
 func (s *Step) draw() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	line := fmt.Sprintf("%s %s", spinnerFrames[s.frame%len(spinnerFrames)], s.title)
+	head := fmt.Sprintf("%s %s", s.p.pal.Cyan(spinnerFrames[s.frame%len(spinnerFrames)]), s.title)
 	s.frame++
 	if s.total > 0 {
-		line += " " + Bar(s.done, s.total, 20)
+		head += " " + Bar(s.done, s.total, 20)
 	}
-	if s.detail != "" {
-		line += " " + s.detail
-	}
-	line += fmt.Sprintf(" (%s)", FormatElapsed(s.p.now().Sub(s.start)))
-	fmt.Fprintf(s.p.w, "\r\033[K%s", line)
+	tail := fmt.Sprintf(" (%s)", FormatElapsed(s.p.now().Sub(s.start)))
+	fmt.Fprintf(s.p.w, "\r\033[K%s", fitLine(head, s.detail, tail, s.p.cols()-1))
 }
 
 // Update sets the detail text shown after the title, e.g. "bm-worker ✓".
@@ -127,11 +136,39 @@ func (s *Step) finish(icon, msg string) {
 		s.ended.Wait()
 		fmt.Fprint(s.p.w, "\r\033[K")
 	}
-	line := fmt.Sprintf("%s %s (%s)", icon, s.title, FormatElapsed(s.p.now().Sub(s.start)))
+	line := fmt.Sprintf("%s %s (%s)", s.p.pal.Icon(icon), s.title, FormatElapsed(s.p.now().Sub(s.start)))
 	if msg != "" {
 		line += ": " + msg
 	}
 	fmt.Fprintln(s.p.w, line)
+}
+
+// fitLine joins head, detail and tail within width characters. A line wider
+// than the terminal wraps, and "\r" then returns only to the start of its last
+// row, so every redraw would leave a copy behind. The detail is shortened
+// first, so the elapsed time in tail stays visible.
+func fitLine(head, detail, tail string, width int) string {
+	line := head + tail
+	if detail != "" {
+		line = head + " " + detail + tail
+	}
+	if width < 1 || VisibleWidth(line) <= width {
+		return line
+	}
+	if room := width - VisibleWidth(head) - VisibleWidth(tail) - 1; detail != "" && room >= 2 {
+		return head + " " + Truncate(detail, room) + tail
+	}
+	return Truncate(StripANSI(head+tail), width) // too narrow even without the detail
+}
+
+// Truncate shortens s to at most width characters, ending in "…". A width
+// below 1 leaves s unchanged.
+func Truncate(s string, width int) string {
+	r := []rune(s)
+	if width < 1 || len(r) <= width {
+		return s
+	}
+	return string(r[:width-1]) + "…"
 }
 
 // Bar renders a fixed-width progress bar like "[########------------] 2/5".
