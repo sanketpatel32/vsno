@@ -93,7 +93,10 @@ func TestEnsureMirrors(t *testing.T) {
 	if !strings.Contains(p.PullSecret, "172.30.0.5:5000") || !strings.Contains(p.PullSecret, "quay.io") {
 		t.Errorf("pull secret = %s", p.PullSecret)
 	}
-	if len(p.Sources) != 2 || p.Sources[0].Mirrors[0] != "172.30.0.5:5000/ocp/release/1111111111111111" {
+	// The payload's repository is mapped; the release image's own is not, so the
+	// kubelet can keep fetching its signature from the source registry.
+	if len(p.Sources) != 1 || p.Sources[0].Source != "quay.io/openshift-release-dev/ocp-v4.0-art-dev" ||
+		p.Sources[0].Mirrors[0] != "172.30.0.5:5000/ocp/release/1111111111111111" {
 		t.Errorf("sources = %+v", p.Sources)
 	}
 	if p.TrustBundle != "CA" {
@@ -159,7 +162,7 @@ func TestRate(t *testing.T) {
 
 func TestEnsureHit(t *testing.T) {
 	ctx := context.Background()
-	r := &mirrorRunner{runner: runner{out: releaseInfo}}
+	r := &mirrorRunner{runner: runner{out: releaseInfo, exists: "yes"}}
 	e := mirrorEnv(t, 50<<30, r)
 	at := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
 	_ = update(ctx, e.Kube, ns, func(m *metadata) {
@@ -178,6 +181,52 @@ func TestEnsureHit(t *testing.T) {
 	}
 	if want := []string{"4.20", "4.20.46"}; !equal(p.Requested, want) {
 		t.Errorf("requested = %q, want %q", p.Requested, want)
+	}
+}
+
+// The record can outlive the images (a prune that failed halfway, a manual
+// delete): that is not a hit, or the guest installs from upstream believing it
+// is reading the mirror.
+func TestEnsureMirrorsWhenTheImagesAreGone(t *testing.T) {
+	ctx := context.Background()
+	r := &mirrorRunner{runner: runner{out: releaseInfo, exists: "no"}}
+	e := mirrorEnv(t, 50<<30, r)
+	at := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
+	_ = update(ctx, e.Kube, ns, func(m *metadata) {
+		m.Entries["sha256:1111111111111111aaaa"] = &Entry{Version: "4.20.46", Image: rel.Image,
+			Digest: "sha256:1111111111111111aaaa", Repo: "ocp/release/1111111111111111", Mirrored: at, SizeBytes: 7 << 30}
+	})
+	p, err := Ensure(ctx, e, EnsureOptions{Namespace: ns, Release: rel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Hit || len(r.mirrorArgs) == 0 {
+		t.Errorf("hit = %v, mirror args %q", p.Hit, r.mirrorArgs)
+	}
+	if len(r.registryCalls) == 0 || r.registryCalls[0][1] != "exists" {
+		t.Errorf("registry calls = %q", r.registryCalls)
+	}
+}
+
+// An entry that is mid-mirror is not usable yet: another create must wait its
+// turn (the script's lock), then mirror, not install from a partial payload.
+func TestEnsureMirrorsAnEntryThatIsNotReady(t *testing.T) {
+	ctx := context.Background()
+	r := &mirrorRunner{runner: runner{out: releaseInfo}}
+	e := mirrorEnv(t, 50<<30, r)
+	_ = update(ctx, e.Kube, ns, func(m *metadata) {
+		m.Entries["sha256:1111111111111111aaaa"] = &Entry{Version: "4.20.46", Image: rel.Image,
+			Digest: "sha256:1111111111111111aaaa", Repo: "ocp/release/1111111111111111", State: StateMirroring}
+	})
+	p, err := Ensure(ctx, e, EnsureOptions{Namespace: ns, Release: rel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Hit || len(r.mirrorArgs) == 0 {
+		t.Errorf("hit = %v, mirror args %q", p.Hit, r.mirrorArgs)
+	}
+	if p.State != "" {
+		t.Errorf("state = %q, want ready once the mirror finished", p.State)
 	}
 }
 
@@ -209,9 +258,18 @@ func TestEnsureErrors(t *testing.T) {
 	ctx := context.Background()
 	t.Run("mirror fails", func(t *testing.T) {
 		r := &mirrorRunner{runner: runner{out: releaseInfo}, mirrorErr: errors.New("exit 1")}
-		_, err := Ensure(ctx, mirrorEnv(t, 50<<30, r), EnsureOptions{Namespace: ns, Release: rel})
+		e := mirrorEnv(t, 50<<30, r)
+		_, err := Ensure(ctx, e, EnsureOptions{Namespace: ns, Release: rel})
 		if err == nil || !strings.Contains(err.Error(), "last line") {
 			t.Errorf("got %v", err)
+		}
+		m, err := load(ctx, e.Kube, ns)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Said out loud, so `cache list` shows it and the next create retries.
+		if ent := m.Entries["sha256:1111111111111111aaaa"]; ent == nil || ent.State != StateFailed {
+			t.Errorf("entry = %+v, want a failed one", ent)
 		}
 	})
 	t.Run("no sources", func(t *testing.T) {

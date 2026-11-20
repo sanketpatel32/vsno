@@ -34,8 +34,9 @@ const (
 	AnnVersion = "vsno.io/version"
 	// AnnCached is "true" when the guest installed from the registry mirror.
 	AnnCached = "vsno.io/cache"
-	// AnnTimingISO, AnnTimingInstall, AnnTimingReboot and AnnTimingAvailable are
-	// how long each phase of a create took, as a Go duration ("8m12s").
+	// AnnTimingISO, AnnTimingInstall and AnnTimingReboot are how long each phase
+	// of a create took, and AnnTimingAvailable the whole create up to the guest's
+	// ClusterVersion being Available, as Go durations ("8m12s").
 	AnnTimingISO       = "vsno.io/timing-iso"
 	AnnTimingInstall   = "vsno.io/timing-install"
 	AnnTimingReboot    = "vsno.io/timing-reboot"
@@ -167,6 +168,11 @@ func newRenderData(s Spec, dnsIP string, sec Secrets) renderData {
 	ann := map[string]string{AnnRequested: s.Release.Requested, AnnImage: s.Release.Image}
 	if s.Release.Version != "" {
 		ann[AnnVersion] = s.Release.Version
+	}
+	if len(sec.ImageDigestSources) > 0 {
+		// Known before the install finishes, so a cache user is visible (and
+		// protected from `cache prune`) from the moment its VM exists.
+		ann[AnnCached] = "true"
 	}
 	return renderData{
 		Spec: s, LabelName: LabelName, BaseDomain: manifests.DefaultBaseDomain,

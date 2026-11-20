@@ -7,7 +7,20 @@ import (
 	"time"
 
 	"github.com/sebrandon1/vsno/lib/cache"
+	"github.com/sebrandon1/vsno/lib/guest"
 )
+
+func TestCacheUsers(t *testing.T) {
+	gs := []guest.Guest{
+		{Name: "cached", Image: "img", Cached: true},
+		{Name: "plain", Image: "img"},
+		{Name: "nameless", Cached: true},
+	}
+	users := cacheUsers(gs)
+	if len(users) != 1 || len(users["img"]) != 1 || users["img"][0] != "cached" {
+		t.Errorf("users = %v", users)
+	}
+}
 
 func TestRenderCache(t *testing.T) {
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
@@ -17,6 +30,7 @@ func TestRenderCache(t *testing.T) {
 				Mirrored: now.Add(-2 * time.Hour), LastUsed: now.Add(-time.Hour), Users: []string{"a", "b"}},
 			{Version: "4.21.0", Image: "quay.io/x:4.21.0", SizeBytes: 3 << 30,
 				Mirrored: now.Add(-48 * time.Hour), LastUsed: now.Add(-48 * time.Hour)},
+			{Version: "4.21.42", Image: "quay.io/x:4.21.42", State: cache.StateMirroring, Started: now.Add(-2 * time.Minute)},
 		},
 		Used: 40 << 30, Total: 100 << 30,
 	}
@@ -25,8 +39,8 @@ func TestRenderCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := b.String()
-	for _, want := range []string{"VERSION", "4.20.46", "quay.io/x:4.20.46", "6.0Gi", "a, b",
-		"registry volume: 40.0Gi of 100.0Gi used, 60.0Gi free"} {
+	for _, want := range []string{"VERSION", "STATE", "4.20.46", "quay.io/x:4.20.46", "6.0Gi", "a, b",
+		"ready", "mirroring 2m", "registry volume: 40.0Gi of 100.0Gi used, 60.0Gi free"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
 		}
