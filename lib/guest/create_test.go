@@ -2,12 +2,15 @@ package guest
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sebrandon1/vsno/lib/apply"
+	"github.com/sebrandon1/vsno/lib/cache"
 	"github.com/sebrandon1/vsno/lib/cluster"
+	"github.com/sebrandon1/vsno/lib/release"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -199,7 +202,7 @@ func TestWaitInstalled(t *testing.T) {
 	ready := probeLine("seed", `"cv":{"version":"4.20.46","available":true},"unhealthy":0`)
 	w := newWorld(t)
 	g := &Guest{Name: "seed"}
-	if err := waitInstalled(ctx, installing(t, w, ready), g, createOpts("seed", "4.20")); err != nil || g.State != Ready || g.Version != "4.20.46" {
+	if err := waitInstalled(ctx, installing(t, w, ready), g, createOpts("seed", "4.20"), time.Now()); err != nil || g.State != Ready || g.Version != "4.20.46" {
 		t.Fatalf("ready: %v %+v", err, g)
 	}
 	if p := w.runner.ran("probe.sh"); len(p) == 0 || strings.Join(p[0].args, " ") != "vsno.lab seed=172.30.9.9" {
@@ -208,37 +211,53 @@ func TestWaitInstalled(t *testing.T) {
 
 	failed := probeLine("seed", `"agent":{"status":"error","info":"disk too small"}`)
 	g = &Guest{Name: "seed"}
-	if err := waitInstalled(ctx, installing(t, newWorld(t), failed), g, createOpts("seed", "4.20")); err == nil || !strings.Contains(err.Error(), "install error: disk too small") {
+	if err := waitInstalled(ctx, installing(t, newWorld(t), failed), g, createOpts("seed", "4.20"), time.Now()); err == nil || !strings.Contains(err.Error(), "install error: disk too small") {
 		t.Errorf("failed: %v", err)
 	}
 
 	stuck := probeLine("seed", `"agent":{"status":"insufficient","validations":"{\"network\":[{\"id\":\"dns-wildcard-not-configured\",\"status\":\"failure\"}]}"}`)
 	o := createOpts("seed", "4.20")
 	o.StuckAfter = time.Millisecond
-	if err := waitInstalled(ctx, installing(t, newWorld(t), stuck), &Guest{Name: "seed"}, o); err == nil || !strings.Contains(err.Error(), "dns-wildcard-not-configured") {
+	if err := waitInstalled(ctx, installing(t, newWorld(t), stuck), &Guest{Name: "seed"}, o, time.Now()); err == nil || !strings.Contains(err.Error(), "dns-wildcard-not-configured") {
 		t.Errorf("stuck: %v", err)
 	}
 
 	slow := probeLine("seed", `"agent":{"status":"installing","progress":10}`)
 	e := installing(t, newWorld(t), slow)
 	e.Timeout = 5 * time.Millisecond
-	if err := waitInstalled(ctx, e, &Guest{Name: "seed"}, createOpts("seed", "4.20")); err == nil || !strings.Contains(err.Error(), "not ready after") {
+	if err := waitInstalled(ctx, e, &Guest{Name: "seed"}, createOpts("seed", "4.20"), time.Now()); err == nil || !strings.Contains(err.Error(), "not ready after") {
 		t.Errorf("timeout: %v", err)
 	}
 
 	gone := newWorld(t).env()
-	if err := waitInstalled(ctx, gone, &Guest{Name: "seed"}, createOpts("seed", "4.20")); err == nil || !strings.Contains(err.Error(), "reading vSNO seed") {
+	if err := waitInstalled(ctx, gone, &Guest{Name: "seed"}, createOpts("seed", "4.20"), time.Now()); err == nil || !strings.Contains(err.Error(), "reading vSNO seed") {
 		t.Errorf("missing VM: %v", err)
 	}
 }
 
-func TestRecordVersion(t *testing.T) {
+func TestRecord(t *testing.T) {
 	w := newWorld(t)
-	if err := recordVersion(context.Background(), w.env(), ns, &Guest{Name: "seed"}); err != nil {
-		t.Errorf("no version, nothing to record: %v", err)
+	if err := record(context.Background(), w.env(), ns, &Guest{Name: "seed"}); err != nil {
+		t.Errorf("nothing to record: %v", err)
 	}
-	if err := recordVersion(context.Background(), w.env(), ns, &Guest{Name: "seed", Version: "4.20.46"}); err == nil {
+	if err := record(context.Background(), w.env(), ns, &Guest{Name: "seed", Version: "4.20.46"}); err == nil {
 		t.Error("want an error for a missing VM")
+	}
+	u, err := w.dyn.Resource(cluster.GVRVirtualMachine).Namespace(ns).Get(context.Background(), "a", metav1.GetOptions{})
+	if err != nil {
+		t.Skip("the world's VM is named a") // the fakes' VM name
+	}
+	_ = u
+}
+
+func TestDur(t *testing.T) {
+	for _, c := range []struct {
+		d    time.Duration
+		want string
+	}{{0, ""}, {-time.Second, ""}, {time.Second, "1s"}, {8*time.Minute + 12*time.Second, "8m12s"}, {500 * time.Millisecond, "1s"}} {
+		if got := dur(c.d); got != c.want {
+			t.Errorf("dur(%v) = %q, want %q", c.d, got, c.want)
+		}
 	}
 }
 
@@ -256,6 +275,17 @@ func TestCreateWaits(t *testing.T) {
 	g, err := Create(context.Background(), e, o)
 	if err != nil || g.State != Ready {
 		t.Fatalf("%v %+v", err, g)
+	}
+	u, err := w.dyn.Resource(cluster.GVRVirtualMachine).Namespace(ns).Get(context.Background(), "seed", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ann := u.GetAnnotations()
+	if ann[AnnVersion] != "4.20.46" || ann[AnnTimingISO] == "" || ann[AnnTimingAvailable] != "" && ann[AnnTimingInstall] == "" {
+		t.Errorf("annotations = %v", ann)
+	}
+	if _, ok := ann[AnnCached]; ok {
+		t.Errorf("cached annotation without a cache: %v", ann)
 	}
 }
 
@@ -289,5 +319,82 @@ func TestPercent(t *testing.T) {
 		if got := percent(c.st, c.detail); got != c.want {
 			t.Errorf("percent(%s, %q) = %d, want %d", c.st, c.detail, got, c.want)
 		}
+	}
+}
+
+// fakeCache answers the guest package's Cache, recording its calls.
+type fakeCache struct {
+	calls int
+	p     *cache.Prepared
+	err   error
+}
+
+func (f *fakeCache) Ensure(_ context.Context, _ string, _ release.Release, onLine func(string)) (*cache.Prepared, error) {
+	f.calls++
+	if onLine != nil {
+		onLine("mirroring")
+	}
+	return f.p, f.err
+}
+
+func mirrored() *cache.Prepared {
+	return &cache.Prepared{
+		Entry:      cache.Entry{Repo: "ocp/release/1111111111111111"},
+		PullSecret: `{"auths":{"quay.io":{},"172.30.0.5:5000":{"auth":"QQ=="}}}`,
+		Sources: []cache.ImageDigestSource{
+			{Source: "quay.io/openshift-release-dev/ocp-release", Mirrors: []string{"172.30.0.5:5000/ocp/release/1111111111111111"}},
+		},
+		TrustBundle: "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n",
+	}
+}
+
+func TestCreateUsesTheCache(t *testing.T) {
+	w := newWorld(t)
+	fc := &fakeCache{p: mirrored()}
+	env := w.env()
+	env.Cache = fc
+	if _, err := Create(context.Background(), env, createOpts("seed", "4.20")); err != nil {
+		t.Fatal(err)
+	}
+	if fc.calls != 1 {
+		t.Fatalf("cache called %d times", fc.calls)
+	}
+	iso := w.runner.ran("iso.sh")
+	for _, want := range []string{"imageDigestSources:", "172.30.0.5:5000/ocp/release/1111111111111111",
+		"additionalTrustBundle:", "172.30.0.5:5000"} {
+		if !strings.Contains(iso[0].stdin, want) {
+			t.Errorf("ISO tarball lacks %q", want)
+		}
+	}
+}
+
+func TestCreateNoCache(t *testing.T) {
+	w := newWorld(t)
+	fc := &fakeCache{p: mirrored()}
+	env := w.env()
+	env.Cache = fc
+	o := createOpts("seed", "4.20")
+	o.NoCache = true
+	if _, err := Create(context.Background(), env, o); err != nil {
+		t.Fatal(err)
+	}
+	if fc.calls != 0 {
+		t.Errorf("cache called %d times", fc.calls)
+	}
+	if iso := w.runner.ran("iso.sh"); strings.Contains(iso[0].stdin, "imageDigestSources") {
+		t.Error("the install config points at a mirror anyway")
+	}
+}
+
+func TestCreateFailsWhenMirroringFails(t *testing.T) {
+	w := newWorld(t)
+	env := w.env()
+	env.Cache = &fakeCache{err: errors.New("registry full")}
+	_, err := Create(context.Background(), env, createOpts("seed", "4.20"))
+	if err == nil || !strings.Contains(err.Error(), "registry full") || !strings.Contains(err.Error(), "--no-cache") {
+		t.Errorf("got %v", err)
+	}
+	if len(w.runner.ran("iso.sh")) != 0 {
+		t.Error("built an ISO after the mirror failed")
 	}
 }

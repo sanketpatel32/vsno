@@ -20,6 +20,7 @@ import (
 	"github.com/sebrandon1/vsno/lib/ui"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/discovery"
 	"sigs.k8s.io/yaml"
 )
@@ -36,6 +37,7 @@ var (
 	suManifests bool
 	suNoProbe   bool
 	suTimeout   time.Duration
+	suRegSize   string
 )
 
 var setupCmd = &cobra.Command{
@@ -91,6 +93,8 @@ func init() {
 	f.BoolVar(&suManifests, "manifests", false, "with --dry-run, also print the manifests (Secret values redacted); implies --dry-run")
 	f.BoolVar(&suNoProbe, "no-probe", false, "skip the precheck hardware probe (then --node is required)")
 	f.DurationVar(&suTimeout, "timeout", 20*time.Minute, "how long to wait for each component")
+	f.StringVar(&suRegSize, "registry-size", manifests.DefaultRegistrySize,
+		"size of the in-cluster registry's volume, which holds mirrored releases (it only grows)")
 	rootCmd.AddCommand(setupCmd)
 }
 
@@ -101,6 +105,9 @@ func runSetup(cmd *cobra.Command, _ []string) error {
 	settings, err := setupSettings()
 	if err != nil {
 		return err
+	}
+	if _, err := resource.ParseQuantity(suRegSize); err != nil {
+		return fmt.Errorf("invalid --registry-size %q: %w", suRegSize, err)
 	}
 	channels, err := operatorChannels(suChannels)
 	if err != nil {
@@ -128,14 +135,15 @@ func runSetup(cmd *cobra.Command, _ []string) error {
 		Progress: progress,
 		Timeout:  suTimeout,
 	}
-	if outputFormat == formatTable {
+	if outputFormat != formatJSON {
 		fmt.Fprintf(cmd.ErrOrStderr(), "Setting up %s in %s (context %q)...\n\n", namespace, c.Config.Host, c.Context)
 	}
 	res, err := setup.Run(cmd.Context(), env, setup.Options{
 		Namespace: namespace, Settings: settings, Yes: suYes, Force: suForce,
 		UpgradeOperators: suUpgrade, Channels: channels, DryRun: suDryRun, Images: manifests.DefaultImages(),
+		RegistrySize: suRegSize,
 	})
-	if outputFormat == formatTable {
+	if outputFormat != formatJSON {
 		fmt.Fprintln(cmd.ErrOrStderr())
 	}
 	if rerr := renderSetup(cmd.OutOrStdout(), res, suDryRun, palette(cmd.OutOrStdout())); rerr != nil && err == nil {
