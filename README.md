@@ -365,6 +365,9 @@ a release mirrored before signatures were copied gets it on its next create.
 Nightlies work the same way; the mirror step needs `registry.ci.openshift.org` credentials in the
 cluster pull secret, which `create` already requires for nightlies. They have no signature to copy.
 
+A release's size in `cache list` is every distinct blob its images reference, layers its neighbours
+share included, so it is what the release holds rather than what pruning it alone would free.
+
 `cache prune` deletes a release's images and then runs `registry garbage-collect` in a Job over the
 registry's volume. The registry is unavailable for the seconds to minutes that takes, and that is
 what actually frees the space; `--no-gc` skips it, and `vsno cache gc` runs it on its own (after

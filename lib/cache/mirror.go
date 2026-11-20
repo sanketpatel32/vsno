@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -97,7 +98,7 @@ func Ensure(ctx context.Context, e Env, o EnsureOptions) (*Prepared, error) {
 	var ent Entry
 	var elapsed time.Duration
 	if hit {
-		ent = *prev // keep what it was mirrored as, not what this request calls it
+		ent = measured(ctx, e, reg, *prev) // keep what it was mirrored as, not what this request calls it
 	} else if ent, elapsed, err = mirrorEntry(ctx, e, o, reg, addr, repo, short(digest), digest, oldRequested(prev), m); err != nil {
 		return nil, err
 	}
@@ -143,13 +144,16 @@ func mirrorEntry(ctx context.Context, e Env, o EnsureOptions, reg registry.Regis
 	if err := saveEntry(ctx, e, o.Namespace, digest, ent); err != nil {
 		return ent, 0, err
 	}
-	size, elapsed, err := mirror(ctx, e, o, reg, addr, repo, tag, m)
+	grew, elapsed, err := mirror(ctx, e, o, reg, addr, repo, tag, m)
 	if err != nil {
 		ent.State, ent.Started = StateFailed, time.Time{}
 		_ = saveEntry(ctx, e, o.Namespace, digest, ent) // best effort: the release is not usable
 		return ent, elapsed, err
 	}
-	ent.State, ent.Started, ent.SizeBytes = "", time.Time{}, size
+	ent.State, ent.Started, ent.SizeBytes = "", time.Time{}, grew
+	if n, err := repoSize(ctx, e, reg, repo); err == nil {
+		ent.SizeBytes, ent.Measured = n, true
+	}
 	return ent, elapsed, nil
 }
 
@@ -162,6 +166,31 @@ func saveEntry(ctx context.Context, e Env, ns, digest string, ent Entry) error {
 func mirrored(ctx context.Context, e Env, reg registry.Registry, ent *Entry) bool {
 	out, err := reg.Run(ctx, e.Builder, reg.Host, "exists", ent.Repo+":"+short(ent.Digest))
 	return err == nil && strings.TrimSpace(string(out)) == "yes"
+}
+
+// measured is ent with its size counted from blobs, if it was recorded before
+// sizes were. It is best effort: a hit must not fail over its size.
+func measured(ctx context.Context, e Env, reg registry.Registry, ent Entry) Entry {
+	if !ent.Measured {
+		if n, err := repoSize(ctx, e, reg, ent.Repo); err == nil {
+			ent.SizeBytes, ent.Measured = n, true
+		}
+	}
+	return ent
+}
+
+// repoSize is how many bytes repo's images take in the registry, counted from
+// the blobs they reference.
+func repoSize(ctx context.Context, e Env, reg registry.Registry, repo string) (int64, error) {
+	out, err := reg.Run(ctx, e.Builder, reg.Host, "size", repo)
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("reading %s's size: %w", repo, err)
+	}
+	return n, nil
 }
 
 // credentials is the tar mirror.sh and signature.sh read on stdin: the cluster
@@ -205,7 +234,9 @@ func copySignature(ctx context.Context, e Env, o EnsureOptions, reg registry.Reg
 }
 
 // mirror copies the release's payload into the registry, after checking there
-// is room, and returns how much it took and how long that took.
+// is room, and returns how much the volume grew and how long that took. The
+// growth undercounts when the blobs were already stored, so the caller records
+// repoSize instead when it can.
 func mirror(ctx context.Context, e Env, o EnsureOptions, reg registry.Registry, addr, repo, tag string, m *metadata) (int64, time.Duration, error) {
 	start := e.Now()
 	used, total, err := e.Volume(ctx, o.Namespace)
