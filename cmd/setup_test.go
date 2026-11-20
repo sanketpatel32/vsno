@@ -183,6 +183,30 @@ func TestPlanAction(t *testing.T) {
 	}
 }
 
+func TestRenderSetupOperatorUpgrade(t *testing.T) {
+	res := setupResult()
+	res.Steps[0] = setup.Step{Name: "cnv", Outcome: setup.Upgraded, Detail: "v1.0.0 → v1.1.0"}
+	var b bytes.Buffer
+	if err := renderSetup(&b, res, false, plain); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	for _, want := range []string{"✓", "cnv", "upgraded", "v1.0.0 → v1.1.0"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q:\n%s", want, out)
+		}
+	}
+	// A dry run plans the upgrade rather than reporting one.
+	res.Steps[0] = setup.Step{Name: "cnv", Outcome: setup.Planned, Detail: "upgrade v1.0.0 → v1.1.0"}
+	b.Reset()
+	if err := renderSetup(&b, res, true, plain); err != nil {
+		t.Fatal(err)
+	}
+	if out := b.String(); !strings.Contains(out, "~") || !strings.Contains(out, "planned") || !strings.Contains(out, "upgrade v1.0.0 → v1.1.0") {
+		t.Errorf("planned upgrade missing:\n%s", out)
+	}
+}
+
 func TestRenderSetupJSONAndEmpty(t *testing.T) {
 	outputFormat = "json"
 	t.Cleanup(func() { outputFormat = "table" })
@@ -203,5 +227,23 @@ func TestRenderSetupJSONAndEmpty(t *testing.T) {
 	b.Reset()
 	if err := renderSetup(&b, &setup.Result{Warnings: []string{"w"}}, false, plain); err != nil || strings.Contains(b.String(), "object(s)") {
 		t.Errorf("failed-before-steps result: %q", b.String())
+	}
+}
+
+func TestOperatorChannels(t *testing.T) {
+	got, err := operatorChannels([]string{"cnv=candidate", "lvms=stable-4.22"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["cnv"] != "candidate" || got["lvms"] != "stable-4.22" {
+		t.Errorf("channels = %v", got)
+	}
+	if m, err := operatorChannels(nil); err != nil || len(m) != 0 {
+		t.Errorf("no channels = %v %v", m, err)
+	}
+	for _, bad := range []string{"cnv", "cnv=", "=candidate", "virt=candidate"} {
+		if _, err := operatorChannels([]string{bad}); err == nil {
+			t.Errorf("%q should not parse", bad)
+		}
 	}
 }
