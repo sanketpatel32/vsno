@@ -345,8 +345,9 @@ func wantsRunning(vm *unstructured.Unstructured) bool {
 // vmOverheadGiB approximates the virt-launcher pod's memory beyond the guest's.
 const vmOverheadGiB = 1
 
-// NodeCapacity reports what's left on node.
-func NodeCapacity(ctx context.Context, kube kubernetes.Interface, node string) (Capacity, error) {
+// NodeCapacity reports what's left on node, for vSNOs whose pods request
+// their memory at percent overcommit (100 for none; see cluster.ReadDensity).
+func NodeCapacity(ctx context.Context, kube kubernetes.Interface, node string, percent int) (Capacity, error) {
 	n, err := kube.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
 	if err != nil {
 		return Capacity{}, fmt.Errorf("reading node %s: %w", node, err)
@@ -367,6 +368,6 @@ func NodeCapacity(ctx context.Context, kube kubernetes.Interface, node string) (
 		}
 	}
 	c := Capacity{Node: node, Cores: n.Status.Allocatable.Cpu().Value(), FreeMemoryGiB: max(0, free>>30)}
-	c.FitDefault = c.FreeMemoryGiB / (DefaultMemoryGiB + vmOverheadGiB)
+	c.FitDefault = c.FreeMemoryGiB / (cluster.RequestGiB(DefaultMemoryGiB, percent) + vmOverheadGiB)
 	return c, nil
 }
