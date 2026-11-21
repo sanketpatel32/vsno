@@ -434,3 +434,32 @@ func TestCreateFailsWhenMirroringFails(t *testing.T) {
 		t.Error("built an ISO after the mirror failed")
 	}
 }
+
+// Fit counts several vSNOs at once, and says when memory is short in a way
+// callers can test for.
+func TestFit(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t)                                                                   // 90 GiB allocatable, nothing running
+	if err := Fit(ctx, w.env(), node, DefaultCores, DefaultMemoryGiB, 5); err != nil { // 5 × 17
+		t.Errorf("five: %v", err)
+	}
+	err := Fit(ctx, w.env(), node, DefaultCores, DefaultMemoryGiB, 6)
+	if !errors.Is(err, ErrNoCapacity) || !strings.Contains(err.Error(), "6 vSNOs of 16 GiB need 102 GiB") {
+		t.Errorf("six: %v", err)
+	}
+	if err := Fit(ctx, w.env(), node, 200, DefaultMemoryGiB, 1); err == nil || errors.Is(err, ErrNoCapacity) {
+		t.Errorf("too many cores is not a memory shortage: %v", err)
+	}
+}
+
+// A size left at 0 is the default, so callers other than vsno create (vsno
+// run) needn't know the defaults.
+func TestCreateOptionsSized(t *testing.T) {
+	o := CreateOptions{}.sized()
+	if o.Cores != DefaultCores || o.MemoryGiB != DefaultMemoryGiB || o.DiskGiB != DefaultDiskGiB {
+		t.Errorf("%+v", o)
+	}
+	if o := (CreateOptions{Cores: 8, MemoryGiB: 24, DiskGiB: 150}).sized(); o.Cores != 8 || o.MemoryGiB != 24 || o.DiskGiB != 150 {
+		t.Errorf("given sizes changed: %+v", o)
+	}
+}
