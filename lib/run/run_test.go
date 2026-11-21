@@ -12,6 +12,7 @@ import (
 	"github.com/sebrandon1/vsno/lib/builder"
 	"github.com/sebrandon1/vsno/lib/cluster"
 	"github.com/sebrandon1/vsno/lib/guest"
+	"github.com/sebrandon1/vsno/lib/ibu"
 	"github.com/sebrandon1/vsno/lib/precheck"
 	"github.com/sebrandon1/vsno/lib/seed"
 	"github.com/sebrandon1/vsno/lib/state"
@@ -262,7 +263,8 @@ func TestToCreate(t *testing.T) {
 	} {
 		o := Options{Namespace: ns}
 		o.defaults()
-		got, err := toCreate(ctx, withNode(t, testEnv("4.22.0"), c.memory), o, p)
+		e := withNode(t, testEnv("4.22.0"), c.memory)
+		got, err := toCreate(ctx, e, o, p, nil) // nothing exists yet
 		if err != nil || !slices.Equal(got, c.want) {
 			t.Errorf("%s: %v %v, want %v", c.memory, got, err, c.want)
 		}
@@ -281,11 +283,15 @@ func TestToCreate(t *testing.T) {
 	}
 	o := Options{Namespace: ns}
 	o.defaults()
-	if got, err := toCreate(ctx, e, o, p); err != nil || !slices.Equal(got, []string{"seed", "target"}) {
+	existing, err := guest.List(ctx, e.Env.Env, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := toCreate(ctx, e, o, p, existing); err != nil || !slices.Equal(got, []string{"seed", "target"}) {
 		t.Errorf("seed exists: %v %v", got, err)
 	}
 	// With a seed image there is only the target.
-	if got, err := toCreate(ctx, withNode(t, testEnv("4.22.0"), "30Gi"), Options{Namespace: ns}, &Plan{Target: "target"}); err != nil || !slices.Equal(got, []string{"target"}) {
+	if got, err := toCreate(ctx, withNode(t, testEnv("4.22.0"), "30Gi"), Options{Namespace: ns}, &Plan{Target: "target"}, nil); err != nil || !slices.Equal(got, []string{"target"}) {
 		t.Errorf("seed image: %v %v", got, err)
 	}
 }
@@ -314,5 +320,41 @@ func TestAfter(t *testing.T) {
 		if got := c.o.after(); got != c.want || afterText[got] == "" {
 			t.Errorf("%+v: %s %q, want %s", c.o, got, afterText[got], c.want)
 		}
+	}
+}
+
+// The plan names the LCA source the run will use.
+func TestPlanLCAText(t *testing.T) {
+	for _, c := range []struct {
+		s    ibu.LCASource
+		want string
+	}{
+		{ibu.LCASource{}, "each vSNO's catalog"},
+		{ibu.LCASource{Ref: "release-4.21"}, "built from release-4.21"},
+		{ibu.LCASource{Ref: "main", Image: "quay.io/x/lca:1"}, "image quay.io/x/lca:1"},
+	} {
+		if got := lcaText(c.s); got != c.want {
+			t.Errorf("%+v = %q, want %q", c.s, got, c.want)
+		}
+	}
+}
+
+// Without the host's version there are no defaults to pick: the error says
+// to pass the versions instead.
+func TestPlanDefaultsNeedTheHostVersion(t *testing.T) {
+	ctx := context.Background()
+	e := testEnv("4.22.0", "4.22.1", "4.22.2")
+	if err := e.Dyn.Resource(precheck.GVRClusterVersion).Delete(ctx, "version", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	o := Options{Namespace: ns}
+	o.defaults()
+	if _, err := makePlan(ctx, e, o); err == nil || !strings.Contains(err.Error(), "pass --target-version and --seed-version") {
+		t.Errorf("err = %v", err)
+	}
+	// Given both versions, nothing is read.
+	o.TargetVersion, o.SeedVersion = "4.22.1", "4.22.2"
+	if _, err := makePlan(ctx, e, o); err != nil {
+		t.Errorf("with versions: %v", err)
 	}
 }
