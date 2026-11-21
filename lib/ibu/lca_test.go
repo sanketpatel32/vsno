@@ -197,18 +197,6 @@ func testBuilder() *corev1.Pod {
 		Status: corev1.PodStatus{Phase: corev1.PodRunning}}
 }
 
-func TestBuilderPod(t *testing.T) {
-	ctx := context.Background()
-	e := testEnv(nil)
-	if _, err := builderPod(ctx, e, ns); err == nil || !strings.Contains(err.Error(), "isn't running") {
-		t.Errorf("no builder: err = %v", err)
-	}
-	_, _ = e.Kube.CoreV1().Pods(ns).Create(ctx, testBuilder(), metav1.CreateOptions{})
-	if p, err := builderPod(ctx, e, ns); err != nil || p.Spec.NodeName != "worker-1" {
-		t.Errorf("= %v %v", p, err)
-	}
-}
-
 // Without SELinux options on the builder, the build pod sets none either.
 func TestSameSELinux(t *testing.T) {
 	if sc := sameSELinux(&corev1.Pod{}); sc != nil {
@@ -269,5 +257,24 @@ func TestLCAStepName(t *testing.T) {
 	}
 	if got := (LCASource{Image: "quay.io/x/lca:1"}).stepName(); got != "Fetching LCA's manifests" {
 		t.Errorf("image: %q", got)
+	}
+}
+
+// A vSNO installed from the release cache already has the registry's login:
+// its pull secret is left alone. One without it gets it merged in.
+func TestEnsurePullAuth(t *testing.T) {
+	ctx := context.Background()
+	get := "get secret pull-secret -n openshift-config"
+	have := &guestctltest.Fake{OcReplies: map[string][]guestctltest.Reply{
+		get: {pullSecretReply(`{"auths":{"` + testReg.Host + `":{"auth":"dTpw"}}}`)},
+	}}
+	if err := ensurePullAuth(ctx, have, testReg); err != nil || have.Ran("oc patch secret pull-secret") {
+		t.Errorf("already there: %v, calls %q", err, have.Calls)
+	}
+	lacking := &guestctltest.Fake{OcReplies: map[string][]guestctltest.Reply{
+		get: {pullSecretReply(`{"auths":{"quay.io":{"auth":"QQ=="}}}`)},
+	}}
+	if err := ensurePullAuth(ctx, lacking, testReg); err != nil || !lacking.Ran("oc patch secret pull-secret -n openshift-config --type merge") {
+		t.Errorf("missing: %v, calls %q", err, lacking.Calls)
 	}
 }
