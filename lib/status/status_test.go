@@ -305,3 +305,15 @@ func vsno(name string) *unstructured.Unstructured {
 	u.SetLabels(map[string]string{guest.LabelName: name})
 	return u
 }
+
+// With nothing set on HyperConverged, the density row says so and passes.
+func TestCollectDensityDefault(t *testing.T) {
+	dyn := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds, healthy()...)
+	r, err := Collect(context.Background(), kube(true, true), dyn, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := byName(r.Host)["density"]; c.Status != precheck.Pass || c.Detail != "memory overcommit 100%, KSM off" {
+		t.Errorf("density = %+v", c)
+	}
+}
