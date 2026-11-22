@@ -44,7 +44,8 @@ func testEnv(hostVersion string, stable ...string) Env {
 	cv.SetKind("ClusterVersion")
 	cv.SetName("version")
 	dyn := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{precheck.GVRClusterVersion: "ClusterVersionList"}, cv)
+		map[schema.GroupVersionResource]string{precheck.GVRClusterVersion: "ClusterVersionList",
+			cluster.GVRVirtualMachine: "VirtualMachineList"}, cv)
 	kube := kfake.NewClientset(
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "registry-auth"}, Data: map[string][]byte{"username": []byte("u"), "password": []byte("p")}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "registry-ca"}, Data: map[string][]byte{"ca.crt": []byte("CA")}},
@@ -157,6 +158,40 @@ func TestMatches(t *testing.T) {
 }
 
 // A seed image an earlier run made is used again instead of a new generation.
+func TestEnsureVSNOsStartsAStoppedVSNO(t *testing.T) {
+	e := testEnv("4.22.0")
+	e.Timeout = 20 * time.Millisecond // the fake never reaches ready
+	vm := &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{"runStrategy": "Halted"}}}
+	vm.SetAPIVersion("kubevirt.io/v1")
+	vm.SetKind("VirtualMachine")
+	vm.SetNamespace(ns)
+	vm.SetName("seed")
+	vm.SetLabels(map[string]string{guest.LabelName: "seed"})
+	vms := e.Dyn.Resource(cluster.GVRVirtualMachine).Namespace(ns)
+	if _, err := vms.Create(context.Background(), vm, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "seed"},
+		Spec: corev1.ServiceSpec{ClusterIP: "172.30.0.1"}}
+	if _, err := e.Kube.CoreV1().Services(ns).Create(context.Background(), svc, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plan{Seed: "seed", SeedVersion: "4.22.2"}
+	existing := []guest.Guest{{Name: "seed", State: guest.Stopped}}
+	// Seedgen stops the seed, so a resumed run must start it: waiting alone
+	// never ends.
+	if err := ensureVSNOs(context.Background(), e, Options{Namespace: ns}, p, []string{"seed"}, existing); err == nil {
+		t.Fatal("expected the wait to fail: the fake never reaches ready")
+	}
+	got, err := vms.Get(context.Background(), "seed", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, _, _ := unstructured.NestedString(got.Object, "spec", "runStrategy"); s != "Always" {
+		t.Errorf("runStrategy = %q, want Always", s)
+	}
+}
+
 func TestEnsureSeedReusesTheImage(t *testing.T) {
 	e := testEnv("4.22.0")
 	e.Builder = listing{out: `{"repo":"seeds/seed","tag":"4.22.2","digest":"sha256:a","created":"2026-11-19T23:00:00Z","labels":{},"size":1}` + "\n"}
@@ -190,6 +225,11 @@ func TestRecordAndResume(t *testing.T) {
 	if got := finished(ctx, e, ns, p.key()); !slices.Equal(got, []Stage{StageSetup}) {
 		t.Errorf("finished = %v", got)
 	}
+	// A later failure at it doesn't undo the stage this plan finished.
+	record(ctx, e, ns, p.key(), StageSetup, errors.New("boom"))
+	if got := finished(ctx, e, ns, p.key()); !slices.Equal(got, []Stage{StageSetup}) {
+		t.Errorf("after a failed retry, finished = %v", got)
+	}
 	p, err = makePlan(ctx, e, o)
 	if err != nil || !strings.Contains(p.String(), "resuming: an earlier run finished [setup]") {
 		t.Errorf("plan = %s, err = %v", p, err)
@@ -198,6 +238,30 @@ func TestRecordAndResume(t *testing.T) {
 	o.TargetName = "target2"
 	if p, err = makePlan(ctx, e, o); err != nil || len(p.Done) != 0 {
 		t.Errorf("another plan: done = %v, err = %v", p.Done, err)
+	}
+}
+
+// A stage an earlier run of the same plan finished isn't run again: a
+// delete-only resume goes straight to the delete stage.
+func TestRunSkipsDoneStages(t *testing.T) {
+	ctx := context.Background()
+	e := testEnv("4.22.0", "4.22.1", "4.22.2")
+	e.Timeout = 20 * time.Millisecond
+	if err := state.Save(ctx, e.Kube, ns, &state.State{}); err != nil {
+		t.Fatal(err)
+	}
+	o := Options{Namespace: ns, Yes: true}
+	o.defaults()
+	p, err := makePlan(ctx, e, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record(ctx, e, ns, p.key(), StageSetup, nil)
+	ran := false
+	e.Setup = func(context.Context) error { ran = true; return nil }
+	res, _ := Run(ctx, e, o) // the stages after setup may fail in the fakes
+	if ran || res.Timings[StageSetup] != "" {
+		t.Errorf("setup ran again: %v", res.Timings)
 	}
 }
 

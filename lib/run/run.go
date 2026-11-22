@@ -178,6 +178,9 @@ func Run(ctx context.Context, e Env, o Options) (*Result, error) {
 		return res, errors.New("not confirmed; pass --yes to run without asking")
 	}
 	for _, s := range plan.Stages {
+		if slices.Contains(plan.Done, s) {
+			continue // an earlier run of this plan finished it
+		}
 		start := e.Now()
 		err := runStage(ctx, e, o, plan, s, res)
 		res.Timings[s] = e.Now().Sub(start).Round(time.Second).String()
@@ -336,6 +339,13 @@ func ensureVSNOs(ctx context.Context, e Env, o Options, plan *Plan, names []stri
 			if err := matches(existing[i], want[name]); err != nil {
 				return err
 			}
+			// An earlier stage may have stopped it: seedgen does, and a
+			// resumed run or a stopped vSNO would otherwise wait forever.
+			if existing[i].State == guest.Stopped {
+				if err := guest.SetRunning(ctx, e.Env.Env, o.Namespace, name, true); err != nil {
+					return fmt.Errorf("starting %s: %w", name, err)
+				}
+			}
 			continue
 		}
 		if _, err := guest.Create(ctx, e.Env.Env, guest.CreateOptions{Namespace: o.Namespace, Name: name, Version: want[name],
@@ -411,8 +421,17 @@ func finished(ctx context.Context, e Env, ns, key string) []Stage {
 	}
 	var out []Stage
 	for _, s := range []Stage{StageSetup, StageVSNOs, StageSeed, StageUpgrade, StageDelete} {
-		if last, ok := st.Last(StageName + ":" + string(s)); ok && last.Status == state.Done && last.Detail == key {
-			out = append(out, s)
+		name := StageName + ":" + string(s)
+		// A stage this plan finished once stays finished, even if a later
+		// attempt at it failed: a run that re-ran finished stages (before Run
+		// skipped them) could fail at an upgrade that had already succeeded,
+		// and that failure would otherwise block the plan's delete stage
+		// forever.
+		for _, rec := range st.Stages {
+			if rec.Name == name && rec.Status == state.Done && rec.Detail == key {
+				out = append(out, s)
+				break
+			}
 		}
 	}
 	return out
